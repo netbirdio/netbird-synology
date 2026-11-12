@@ -80,7 +80,7 @@ Use conventional PR titles such as `feat:`, `fix:`, `chore:`, or `docs:` for cat
 
 **Update NetBird** checks for a newer stable client daily at 07:00 UTC. It verifies both downloads, runs tests, builds both packages, and opens or updates `automation/netbird-bump`. It can also be run manually with `latest` or a stable version. Merging that PR updates the draft; publishing remains a maintainer action.
 
-The workflows use GitHub's built-in `GITHUB_TOKEN`. The updater validates packages before opening its PR; additional PR workflow runs may require [manual approval](https://docs.github.com/en/actions/concepts/security/github_token).
+The updater uses a personal access token (PAT) stored as the `GH_PAT` Actions secret to push its branch and open PRs. This allows update PRs to trigger the PR build workflow. Other workflow operations use GitHub's built-in `GITHUB_TOKEN`.
 
 ### Retry a failed release
 
@@ -91,7 +91,7 @@ Rerun the failed workflow, or dispatch **Build SPK Release** with the published 
 Configure these settings in `netbirdio/netbird-synology` before publishing packages:
 
 - Set **Settings → Pages → Build and deployment → Source** to **GitHub Actions**. Allow release tags in the `github-pages` environment's deployment policy.
-- Enable **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests** so the upstream updater can open PRs. Default token permissions can remain read-only; workflows request their required permissions.
+- Add a fine-grained PAT scoped to this repository as the `GH_PAT` Actions secret, with **Contents: Read and write** and **Pull requests: Read and write** permissions. Default `GITHUB_TOKEN` permissions can remain read-only; workflows request their required permissions.
 - Run **Draft release** manually to create the initial draft if needed.
 
 The release workflows use `GITHUB_REPOSITORY` for release links and the configured GitHub Pages base URL for package sources. The URLs in the README assume `https://netbirdio.github.io/netbird-synology/`; update them if Pages uses a custom domain. Publishing the first release builds the SPKs and deploys the catalogs.
