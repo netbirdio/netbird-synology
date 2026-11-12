@@ -1,0 +1,175 @@
+name: Build SPK Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release tag to resume (for example v0.80.0-5)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize uploads and Pages deployments. A retry of an older release must
+# never replace the catalog for a newer package.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      pkg: ${{ steps.version.outputs.pkg }}
+      upstream: ${{ steps.version.outputs.upstream }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag || github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Validate the published release and tagged VERSION
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json isDraft --jq '.isDraft == false' | grep -qx true
+          python3 -B scripts/version.py release --tag "$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Test package scripts
+        run: make test
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - synology_arch: x86_64
+            netbird_arch: amd64
+          - synology_arch: aarch64
+            netbird_arch: arm64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Reuse an already uploaded SPK on retries
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          ASSET: netbird_${{ needs.prepare.outputs.pkg }}_synology_${{ matrix.netbird_arch }}.spk
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json assets > "$RUNNER_TEMP/assets.json"
+          if jq -e --arg name "$ASSET" '.assets | any(.name == $name)' "$RUNNER_TEMP/assets.json" >/dev/null; then
+            gh release download "$TAG" --pattern "$ASSET"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download verified upstream binary and build SPK
+        if: steps.existing.outputs.found != 'true'
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.pkg }}
+          SYNOLOGY_ARCH: ${{ matrix.synology_arch }}
+        run: make download package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: netbird_${{ needs.prepare.outputs.pkg }}_synology_${{ matrix.netbird_arch }}
+          path: netbird_${{ needs.prepare.outputs.pkg }}_synology_${{ matrix.netbird_arch }}.spk
+          if-no-files-found: error
+
+  publish-release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: netbird_${{ needs.prepare.outputs.pkg }}_synology_*
+          merge-multiple: true
+
+      - name: Upload both architectures without replacing published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PKG: ${{ needs.prepare.outputs.pkg }}
+        run: |
+          set -euo pipefail
+          # Check both INFO files before attaching anything to the release.
+          python3 -B scripts/build-catalog.py --version "$PKG" --repo "$GITHUB_REPOSITORY" --base-url https://example.invalid --output "$RUNNER_TEMP/catalog-check"
+          gh release view "$TAG" --json assets > "$RUNNER_TEMP/assets.json"
+          for arch in amd64 arm64; do
+            asset="netbird_${PKG}_synology_${arch}.spk"
+            if ! jq -e --arg name "$asset" '.assets | any(.name == $name)' "$RUNNER_TEMP/assets.json" >/dev/null; then
+              gh release upload "$TAG" "$asset"
+            fi
+          done
+
+  deploy-catalog:
+    needs: [prepare, publish-release]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Only deploy the newest stable package
+        id: eligible
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" | jq 'add' > "$RUNNER_TEMP/releases.json"
+          python3 -B scripts/version.py catalog --tag "$TAG" --releases-file "$RUNNER_TEMP/releases.json" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/configure-pages@v6
+        if: steps.eligible.outputs.deploy_catalog == 'true'
+        id: pages
+
+      - uses: actions/download-artifact@v8
+        if: steps.eligible.outputs.deploy_catalog == 'true'
+        with:
+          pattern: netbird_${{ needs.prepare.outputs.pkg }}_synology_*
+          merge-multiple: true
+
+      - name: Build catalog from the release SPKs
+        if: steps.eligible.outputs.deploy_catalog == 'true'
+        env:
+          PKG: ${{ needs.prepare.outputs.pkg }}
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: python3 -B scripts/build-catalog.py --version "$PKG" --repo "$GITHUB_REPOSITORY" --base-url "$BASE_URL"
+
+      - uses: actions/upload-pages-artifact@v5
+        if: steps.eligible.outputs.deploy_catalog == 'true'
+        with:
+          path: _site
+
+      - uses: actions/deploy-pages@v5
+        if: steps.eligible.outputs.deploy_catalog == 'true'
+        id: deploy

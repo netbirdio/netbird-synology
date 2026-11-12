@@ -1,0 +1,361 @@
+#!/bin/sh
+
+SERVICE_NAME="netbird"
+
+# Default PKGVAR/PKGDEST so the script also works when invoked outside the
+# synopkg framework (for example, a DSM Task Scheduler task running as root).
+# See docs/advanced-setup.md#kernel-tun-mode.
+PKGVAR="${SYNOPKG_PKGVAR:-/var/packages/netbird/var}"
+PKGDEST="${SYNOPKG_PKGDEST:-/var/packages/netbird/target}"
+
+PID_FILE="${PKGVAR}/netbird.pid"
+LOG_FILE="${PKGVAR}/netbird.log"
+CONFIG_FILE="${PKGVAR}/config.json"
+SOCKET_FILE="${PKGVAR}/netbird.sock"
+DAEMON_ADDR="unix://${SOCKET_FILE}"
+
+. "$(dirname "$0")/netbird-common"
+
+# NetBird bundles wireguard-go, so kernel WireGuard is never needed.
+export NB_WG_KERNEL_DISABLED=true
+
+# Keep all state inside the package var directory so uninstall is clean and
+# we never touch /var/lib/netbird or /var/run.
+export NB_STATE_DIR="${PKGVAR}"
+export NB_CONFIG="${CONFIG_FILE}"
+export NB_DAEMON_ADDR="${DAEMON_ADDR}"
+export NB_ENABLE_JSON_SOCKET=true
+export NB_JSON_SOCKET="unix://${PKGVAR}/run/netbird-http.sock"
+export HOME="${PKGVAR}"
+
+configure_networking() {
+    # Package Center runs us as the unprivileged package user. A writable
+    # /dev/net/tun alone does not grant CAP_NET_ADMIN, so always use netstack
+    # unless explicitly started as root via the optional Task Scheduler path.
+    export NB_USE_NETSTACK_MODE=true
+    NETWORK_MODE="netstack with local forwarding"
+
+    if [ "$(id -u)" -eq 0 ]; then
+        state_dir=$(readlink -f "$PKGVAR")
+        warning="NetBird: Starting as root can create root-owned state. Before returning to Package Center, disable the root task, stop this daemon as root, and restore netbird:netbird ownership of ${state_dir:-$PKGVAR}. See 'Returning to Package Center' in the README."
+        printf '%s\n' "$warning" >>"$LOG_FILE"
+        printf '%s\n' "$warning" | logger -t netbird-pkg 2>/dev/null || :
+        if ! lsmod 2>/dev/null | grep -q "^tun "; then
+            modprobe tun 2>/dev/null || insmod /lib/modules/tun.ko 2>/dev/null || true
+        fi
+        if [ ! -c /dev/net/tun ]; then
+            [ -d /dev/net ] || mkdir -m 755 /dev/net 2>/dev/null
+            mknod /dev/net/tun c 10 200 2>/dev/null
+        fi
+        if [ -c /dev/net/tun ] && [ -w /dev/net/tun ]; then
+            export NB_USE_NETSTACK_MODE=false
+            NETWORK_MODE="kernel TUN"
+        fi
+    fi
+
+    if [ "${NB_USE_NETSTACK_MODE}" = true ]; then
+        # Match upstream's rootless image: forward permitted inbound traffic
+        # on the NetBird IP to host loopback listeners (DSM, SSH, SMB, etc.).
+        # NetBird access policies still apply, including to loopback-only apps.
+        export NB_ENABLE_NETSTACK_LOCAL_FORWARDING=true
+        export NB_DISABLE_DNS=true
+        export NB_ENABLE_CAPTURE=false
+    fi
+}
+
+# Keep a bounded tail and report whether this stream contained our marker.
+# Rotated files are eligible only when they contain this attempt's marker.
+startup_log_tail() {
+    awk -v marker="$START_MARKER" -v require_marker="${1:-false}" '
+        $0 == marker { count = 0; found = 1; next }
+        { lines[count++ % 20] = $0 }
+        END {
+            if (require_marker == "true" && !found) exit 1
+            first = count > 20 ? count - 20 : 0
+            for (i = first; i < count; i++) print lines[i % 20]
+            exit !found
+        }
+    '
+}
+
+capture_startup_log() {
+    # Pin the original inode across rename/unlink. If its marker disappeared,
+    # copytruncate may have moved the failure to a rotated (possibly gzipped)
+    # copy. Recover that marked tail before any post-truncation output.
+    if ! startup_log_tail <&3 >"$START_LOG"; then
+        for rotated in "$LOG_FILE".* "${LOG_FILE%.log}"-*.log*; do
+            [ -f "$rotated" ] || continue
+            case "$rotated" in "$LOG_FILE".startup.*) continue ;; esac
+            if {
+                case "$rotated" in
+                    *.gz) gzip -cd "$rotated" 2>/dev/null ;;
+                    *) cat "$rotated" ;;
+                esac
+            } | startup_log_tail true >"$START_LOG.rotated"; then
+                cat "$START_LOG" >>"$START_LOG.rotated"
+                mv "$START_LOG.rotated" "$START_LOG"
+                break
+            fi
+        done
+    fi
+    # NetBird may reopen the pathname after a rename. Read that new file too;
+    # it cannot contain output from before this attempt's marker.
+    if [ -f "$LOG_FILE" ] && [ ! "$LOG_FILE" -ef /proc/self/fd/3 ]; then
+        tail -n 20 "$LOG_FILE" >>"$START_LOG" 2>/dev/null
+    fi
+}
+
+startup_failure_message() {
+    # Never put a raw daemon line in DSM's dialog. Errors may include URLs,
+    # profile data or credentials. Only these fixed summaries leave the logs.
+    if grep -qi 'permission denied\|operation not permitted' "$START_LOG"; then
+        reason="The daemon could not access a required file or resource. Check package-user permissions on the state directory."
+    elif grep -qi 'no space left on device\|disk quota exceeded' "$START_LOG"; then
+        reason="The daemon ran out of disk space. Free space on the package volume and retry."
+    elif grep -qi 'read-only file system' "$START_LOG"; then
+        reason="The package volume is read-only. Restore write access before starting."
+    elif grep -qi 'address already in use' "$START_LOG"; then
+        reason="A daemon socket or port is already in use. Stop the conflicting instance and retry."
+    elif grep -qi 'invalid character\|unexpected end of JSON\|cannot unmarshal' "$START_LOG"; then
+        reason="The daemon could not read its configuration or profile JSON. Restore the affected file from backup; do not delete enrollment data."
+    else
+        reason="The daemon exited during startup (exit code ${DAEMON_EXIT})."
+    fi
+    package_error "$reason See ${LOG_FILE} and the netbird-pkg system log for details."
+}
+
+start_daemon() (
+    check_manual_install || return 1
+    prepare_package_config || return 1
+    check_package_state_access || return 1
+
+    # NetBird's JSON socket is unauthenticated for local callers. Keep it in a
+    # private directory even if the daemon gives the socket broader permissions.
+    if [ -L "${PKGVAR}/run" ] ||
+       ! { [ -d "${PKGVAR}/run" ] || mkdir -m 700 "${PKGVAR}/run"; } ||
+       ! chmod 700 "${PKGVAR}/run"; then
+        package_recovery_error "Cannot prepare the private control socket directory."
+        return 1
+    fi
+
+    # Ensure binary and CLI wrapper are executable
+    chmod +x "${PKGDEST}/bin/netbird.bin" "${PKGDEST}/bin/netbird" 2>/dev/null
+    if [ ! -f "${PKGDEST}/bin/netbird.bin" ] || [ ! -x "${PKGDEST}/bin/netbird.bin" ]; then
+        package_error "The package daemon is missing or not executable. Reinstall the package to restore its binary."
+        return 1
+    fi
+    if { [ -e "$LOG_FILE" ] && [ ! -f "$LOG_FILE" ]; } ||
+       ! (umask 077; : >>"$LOG_FILE") 2>/dev/null || [ ! -r "$LOG_FILE" ]; then
+        package_recovery_error "Cannot open ${LOG_FILE}. Restore package-user read/write access and check free disk space before starting."
+        return 1
+    fi
+    if ! (umask 077; : >"$PID_FILE") 2>/dev/null; then
+        package_recovery_error "Cannot write ${PID_FILE}. Restore package-user write access before starting."
+        return 1
+    fi
+
+    # Captured daemon output is private, including recovery from rotated logs.
+    umask 077
+    START_LOG=$(mktemp "${PKGVAR}/netbird.log.startup.XXXXXX") || {
+        package_error "Cannot create startup diagnostics in ${PKGVAR}. Check permissions and free disk space."
+        return 1
+    }
+    trap 'rm -f "$START_LOG" "$START_LOG.rotated"' EXIT
+    trap 'exit 1' HUP INT TERM
+    START_MARKER="--- NetBird startup ${START_LOG##*/} ---"
+    exec 3<"$LOG_FILE"
+    printf '\n%s\n' "$START_MARKER" >>"$LOG_FILE" || {
+        package_error "Cannot write ${LOG_FILE}. Check permissions and free disk space."
+        return 1
+    }
+
+    configure_networking
+    echo "$(date) Starting ${SERVICE_NAME} (${NETWORK_MODE})..." >>"${LOG_FILE}"
+
+    nohup "${PKGDEST}/bin/netbird.bin" service run \
+        --config "${CONFIG_FILE}" \
+        --log-file "${LOG_FILE}" \
+        --log-level info \
+        --daemon-addr "${DAEMON_ADDR}" \
+        --enable-json-socket \
+        --json-socket "unix://${PKGVAR}/run/netbird-http.sock" \
+        3<&- >>"${LOG_FILE}" 2>&1 &
+
+    DAEMON_PID=$!
+    echo "$DAEMON_PID" >"${PID_FILE}"
+
+    # Give the daemon a moment to start (or crash)
+    sleep 2
+
+    daemon_status
+    state=$?
+    if [ "$state" -eq 0 ]; then
+        echo "$(date) ${SERVICE_NAME} started successfully (PID=$(cat "${PID_FILE}"))" >>"${LOG_FILE}"
+        return 0
+    elif [ "$state" -eq 2 ]; then
+        package_recovery_error "$STATUS_ERROR The new daemon's PID tracking has been kept."
+        return 1
+    else
+        wait "$DAEMON_PID"
+        DAEMON_EXIT=$?
+        capture_startup_log
+        tail -n 20 "$START_LOG" | logger -t netbird-pkg 2>/dev/null || :
+        rm -f "${PID_FILE}"
+        startup_failure_message
+        return 1
+    fi
+)
+
+stop_daemon() {
+    daemon_status
+    state=$?
+    if [ "$state" -eq 2 ]; then
+        package_recovery_error "$STATUS_ERROR PID tracking has been kept."
+        return 1
+    fi
+    if [ "$state" -eq 0 ]; then
+        if [ "$(id -u)" -ne 0 ] && [ "$(id -u)" != "$PID_UID" ]; then
+            package_recovery_error "Cannot stop NetBird PID ${PID}, owned by UID ${PID_UID}. The daemon is still running; PID tracking has been kept."
+            return 1
+        fi
+        (printf '%s Stopping %s PID=%s\n' "$(date)" "$SERVICE_NAME" "$PID" >>"$LOG_FILE") 2>/dev/null || :
+        if ! kill -TERM "$PID" 2>/dev/null && tracked_daemon_alive; then
+            package_recovery_error "Cannot stop NetBird PID ${PID}. The daemon is still running; PID tracking has been kept."
+            return 1
+        fi
+        if ! wait_for_exit 20; then
+            if ! kill -KILL "$PID" 2>/dev/null && tracked_daemon_alive; then
+                package_recovery_error "Cannot kill NetBird PID ${PID}. The daemon is still running; PID tracking has been kept."
+                return 1
+            fi
+            if ! wait_for_exit 5; then
+                package_recovery_error "NetBird PID ${PID} did not exit. PID tracking has been kept; stop the daemon before starting again."
+                return 1
+            fi
+        fi
+    fi
+    if ! rm -f "$PID_FILE"; then
+        package_recovery_error "The daemon has stopped, but ${PID_FILE} could not be removed."
+        return 1
+    fi
+    return 0
+}
+
+# 0: a verified package daemon is running; 1: stopped; 2: cannot determine
+# safely. This is read-only: status must not erase tracking on access failure.
+daemon_status() {
+    PID=""
+    STATUS_ERROR=""
+    if [ -e "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
+        if [ -f "$PID_FILE" ] && [ -r "$PID_FILE" ]; then
+            candidate=$(cat "$PID_FILE" 2>/dev/null) || STATUS_ERROR="Cannot read PID tracking in ${PID_FILE}."
+            case "$candidate" in
+                ''|*[!0-9]*|0|1) : ;; # Never signal these; scan for an orphan below.
+                *)
+                    package_daemon_matches "/proc/$candidate"
+                    case $? in
+                        0) PID=$candidate ;;
+                        2) STATUS_ERROR="Cannot inspect tracked daemon PID ${candidate}." ;;
+                    esac
+                    ;;
+            esac
+        else
+            STATUS_ERROR="Cannot read PID tracking in ${PID_FILE}."
+        fi
+    fi
+
+    # Older launchers could remove the PID file after a failed stop. Find that
+    # daemon rather than starting a second one or reporting a successful stop.
+    for proc in /proc/[0-9]*; do
+        [ "${proc##*/}" = "$PID" ] && continue
+        IFS= read -r name 2>/dev/null <"$proc/comm" || continue
+        case "$name" in netbird|netbird.bin) ;; *) continue ;; esac
+        package_daemon_matches "$proc"
+        match=$?
+        if [ "$match" -eq 2 ]; then
+            STATUS_ERROR="Cannot inspect an existing NetBird process."
+        elif [ "$match" -eq 0 ]; then
+            if [ -n "$PID" ]; then
+                STATUS_ERROR="Multiple daemons are using this package's state. Stop them as an administrator before continuing."
+                return 2
+            fi
+            PID=${proc##*/}
+        fi
+    done
+    if [ -z "$PID" ]; then
+        [ -z "$STATUS_ERROR" ] && return 1
+        return 2
+    fi
+    PID_UID=$(awk '/^Uid:/ { print $3 }' "/proc/$PID/status" 2>/dev/null)
+    PID_START=$(awk '{ print $22 }' "/proc/$PID/stat" 2>/dev/null)
+    if [ -z "$PID_UID" ] || [ -z "$PID_START" ]; then
+        [ -d "/proc/$PID" ] || return 1
+        STATUS_ERROR="Cannot verify the owner and identity of NetBird PID ${PID}."
+        return 2
+    fi
+    tracked_daemon_alive
+}
+
+tracked_daemon_alive() {
+    [ -d "/proc/$PID" ] || return 1
+    info=$(awk '{ print $3, $22 }' "/proc/$PID/stat" 2>/dev/null)
+    # Unreadable metadata does not establish that the daemon exited.
+    [ -n "$info" ] || return 0
+    [ "${info#* }" = "$PID_START" ] || return 1
+    case "${info%% *}" in Z|X) return 1 ;; esac
+    return 0
+}
+
+wait_for_exit() {
+    counter=$1
+    while [ ${counter} -gt 0 ]; do
+        tracked_daemon_alive || return 0
+        counter=$((counter - 1))
+        sleep 1
+    done
+    tracked_daemon_alive || return 0
+    return 1
+}
+
+check_existing_daemon_owner() {
+    daemon_status
+    DAEMON_STATE=$?
+    if [ "$DAEMON_STATE" -eq 2 ]; then
+        package_recovery_error "$STATUS_ERROR"
+        return 1
+    fi
+    if [ "$DAEMON_STATE" -eq 0 ] && [ "$(id -u)" != "$PID_UID" ]; then
+        package_recovery_error "NetBird is already running as UID ${PID_UID} (PID ${PID}). Stop that daemon before switching execution users."
+        return 1
+    fi
+    return 0
+}
+
+case "$1" in
+prestart)
+    # Run before DSM acquires resources such as the CLI symlink. Keep the
+    # start-time check as well for direct Task Scheduler/script invocation.
+    check_manual_install && check_existing_daemon_owner && check_package_state_access
+    exit $?
+    ;;
+start)
+    check_existing_daemon_owner || exit 1
+    if [ "$DAEMON_STATE" -eq 0 ]; then
+        check_package_state_access || exit 1
+        exit 0
+    fi
+    start_daemon
+    exit $?
+    ;;
+stop)
+    stop_daemon
+    exit $?
+    ;;
+status)
+    daemon_status
+    state=$?
+    [ "$state" -eq 0 ] && exit 0
+    [ "$state" -eq 1 ] && exit 3
+    exit 1
+    ;;
+esac

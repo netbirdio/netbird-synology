@@ -1,0 +1,94 @@
+name: PR SPK Build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Makefile'
+      - 'VERSION'
+      - 'SHA256SUMS'
+      - 'spk/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    outputs:
+      pkg: ${{ steps.ver.outputs.pkg }}
+      upstream: ${{ steps.ver.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Test package scripts
+        run: make test
+
+      - name: Resolve versions
+        id: ver
+        run: |
+          python3 -B scripts/version.py pr >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - synology_arch: x86_64
+            netbird_arch: amd64
+          - synology_arch: aarch64
+            netbird_arch: arm64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download NetBird binary (upstream)
+        env:
+          PACKAGE_VERSION: ${{ needs.setup.outputs.pkg }}
+          SYNOLOGY_ARCH: ${{ matrix.synology_arch }}
+        run: make download package
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: netbird_${{ needs.setup.outputs.pkg }}_synology_${{ matrix.netbird_arch }}
+          path: netbird_${{ needs.setup.outputs.pkg }}_synology_${{ matrix.netbird_arch }}.spk
+          if-no-files-found: error
+          retention-days: 14
+
+  comment:
+    needs: [setup, build]
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pr-spk-build
+          message: |
+            ### SPK builds for this PR
+
+            Built from upstream NetBird `v${{ needs.setup.outputs.upstream }}` as package version `${{ needs.setup.outputs.pkg }}`.
+
+            **Download:** [Checks tab for this run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) → *PR SPK Build* → Artifacts:
+
+            - `netbird_${{ needs.setup.outputs.pkg }}_synology_amd64` — x86_64 (DS918+, DS920+, DS1821+, etc.)
+            - `netbird_${{ needs.setup.outputs.pkg }}_synology_arm64` — aarch64 (DS220j, DS418j, etc.)
+
+            Install via **Package Center → Manual Install**. Revision `0` is reserved for development so the next release can upgrade it. Uninstall a previously installed release (including older PR builds with high revisions) before testing this build; back up enrollment first. Install the next release to return to the normal update channel.
+
+            _Artifacts expire 14 days after the run._
