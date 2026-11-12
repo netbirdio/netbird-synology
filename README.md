@@ -1,10 +1,13 @@
 # NetBird for Synology DSM
 
+> [!WARNING]
+> **Beta: under active development.** This Synology package is intended for testing and evaluation. Expect bugs, breaking changes, and changes to installation and upgrade procedures.
+>
+> Avoid using it for critical production workloads. Back up your configuration before installing or updating, and keep another way to access DSM in case the NetBird connection becomes unavailable.
+
 Run [NetBird](https://netbird.io/) on your Synology NAS and reach DSM, SSH, SMB, and other NAS services through its NetBird IP. The package integrates with Package Center and includes a web interface for enrollment, connection status, peer details, and troubleshooting.
 
 [Download a release](https://github.com/netbirdio/netbird-synology/releases/latest) · [Package source](https://netbirdio.github.io/netbird-synology/) · [Report an issue](https://github.com/netbirdio/netbird-synology/issues)
-
-> **Under active development.** This repository contains the NetBird Synology DSM development package. Features and installation procedures may change.
 
 The release and package-source links below target `netbirdio/netbird-synology`. Downloads and Package Center updates require a published release and GitHub Pages deployment in that repository. Until then, use the [local build instructions](CONTRIBUTING.md#build-a-package) to test the package.
 
