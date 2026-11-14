@@ -11,8 +11,7 @@ on:
         default: latest
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: update-netbird
@@ -38,8 +37,7 @@ jobs:
         if: steps.upstream.outputs.changed == 'true'
         run: make test
 
-      # GITHUB_TOKEN-created PRs do not trigger pull_request workflows, so run
-      # the same package builds here before opening or updating the PR.
+      # Validate both architectures before opening or updating the PR.
       - name: Build and validate both architectures
         if: steps.upstream.outputs.changed == 'true'
         run: |
@@ -51,7 +49,7 @@ jobs:
       - name: Open or update the upstream PR
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ github.token }}
+          token: ${{ secrets.GH_PAT }}
           branch: automation/netbird-bump
           delete-branch: true
           add-paths: |
